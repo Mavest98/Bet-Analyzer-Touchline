@@ -160,6 +160,20 @@ def fetch_fixture(
     return fixture
 
 
+def fetch_match_result(fixture_id: int) -> dict[str, Any]:
+    """Fetch a match's current status and full-time score."""
+    payload = _fetch(f"matches/{fixture_id}")
+    if not isinstance(payload.get("id"), int) or payload["id"] != fixture_id:
+        raise SportsAPIError("football-data.org returned an unexpected match.")
+    score = payload.get("score")
+    full_time = score.get("fullTime") if isinstance(score, dict) else None
+    return {
+        "status": payload.get("status"),
+        "home_goals": full_time.get("home") if isinstance(full_time, dict) else None,
+        "away_goals": full_time.get("away") if isinstance(full_time, dict) else None,
+    }
+
+
 def _normalize_fixture(match: dict[str, Any], league_id: int) -> dict[str, Any]:
     home, away = match.get("homeTeam"), match.get("awayTeam")
     competition, season = match.get("competition", {}), match.get("season", {})

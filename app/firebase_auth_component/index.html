@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: "DM Sans", "Segoe UI", sans-serif;
+        background: #111a18;
+        color: #edf4ef;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; padding: 8px; background: transparent; }
+      .auth-card {
+        border: 1px solid rgba(215, 236, 226, .12);
+        border-radius: 16px;
+        padding: 20px;
+        background: linear-gradient(145deg, #14201c, #101715);
+      }
+      .eyebrow {
+        color: #c9f27a;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: .15em;
+        text-transform: uppercase;
+      }
+      h2 { margin: 5px 0 7px; font-size: 20px; letter-spacing: -.03em; }
+      p, .hint { color: #91a49b; font-size: 13px; line-height: 1.5; }
+      p { margin: 0 0 14px; }
+      .providers { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+      button {
+        min-height: 40px;
+        padding: 9px 12px;
+        border: 1px solid rgba(215, 236, 226, .15);
+        border-radius: 9px;
+        background: #1a2822;
+        color: #edf4ef;
+        cursor: pointer;
+        font: 600 13px "DM Sans", sans-serif;
+      }
+      button:hover { border-color: #c9f27a; }
+      button.primary { background: #c9f27a; border-color: #c9f27a; color: #17200e; }
+      button.link { border: 0; background: transparent; color: #c9f27a; padding: 7px 0; }
+      button:disabled { cursor: wait; opacity: .65; }
+      .divider { display: flex; align-items: center; gap: 10px; margin: 14px 0; color: #91a49b; font-size: 12px; }
+      .divider::before, .divider::after { content: ""; height: 1px; flex: 1; background: rgba(215, 236, 226, .12); }
+      .form { display: grid; gap: 9px; }
+      input {
+        width: 100%;
+        min-height: 40px;
+        padding: 9px 11px;
+        border: 1px solid rgba(215, 236, 226, .14);
+        border-radius: 9px;
+        background: #0e1714;
+        color: #edf4ef;
+        font: 14px "DM Sans", sans-serif;
+      }
+      .actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .message { min-height: 20px; margin-top: 10px; color: #c9f27a; font-size: 13px; }
+      .message.error { color: #ff887d; }
+      .hidden { display: none !important; }
+      @media (max-width: 480px) {
+        .providers { grid-template-columns: 1fr; }
+        .auth-card { padding: 16px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="auth-card">
+      <div id="signed-out">
+        <div class="eyebrow">PRIVATE MATCHDAY WORKSPACE</div>
+        <h2>Your matchday, your workspace.</h2>
+        <p>Create an account or sign in to build private slates and track your forecasts.</p>
+        <div class="providers">
+          <button data-provider="google">Continue with Google</button>
+          <button data-provider="microsoft">Continue with Microsoft</button>
+          <button data-provider="apple">Continue with Apple</button>
+          <button data-provider="github">Continue with GitHub</button>
+        </div>
+        <div class="divider">or use email</div>
+        <div class="form">
+          <div class="actions">
+            <strong id="form-title">Sign in</strong>
+            <button id="mode-toggle" class="link" type="button">Create an account</button>
+          </div>
+          <input id="display-name" class="hidden" autocomplete="name" placeholder="Your name">
+          <input id="email" type="email" autocomplete="email" placeholder="Email address" required>
+          <input id="password" type="password" autocomplete="current-password" placeholder="Password" required>
+          <input id="password-confirm" class="hidden" type="password" autocomplete="new-password" placeholder="Confirm password">
+          <button id="submit" class="primary" type="button">Sign in</button>
+          <button id="forgot" class="link" type="button">Forgot password?</button>
+        </div>
+      </div>
+      <div id="signed-in" class="hidden">
+        <div class="eyebrow">ACCOUNT</div>
+        <h2 id="account-email"></h2>
+        <p>You are signed in. Your predictions are private to this account.</p>
+        <button id="logout" type="button">Sign out</button>
+      </div>
+      <div id="verify-email" class="hidden">
+        <div class="eyebrow">VERIFY YOUR EMAIL</div>
+        <h2>One more step</h2>
+        <p id="verify-copy">Check your inbox for the verification link, then return here and sign in again.</p>
+        <div class="actions">
+          <button id="verify-continue" type="button">I verified my email</button>
+          <button id="resend-verification" type="button">Resend verification email</button>
+          <button id="verify-signout" class="link" type="button">Use another account</button>
+        </div>
+      </div>
+      <div id="message" class="message" role="status" aria-live="polite"></div>
+    </main>
+    <script type="module">
+      import { initializeApp } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-app.js";
+      import {
+        GithubAuthProvider,
+        GoogleAuthProvider,
+        OAuthProvider,
+        createUserWithEmailAndPassword,
+        getAuth,
+        onIdTokenChanged,
+        sendEmailVerification,
+        sendPasswordResetEmail,
+        signInWithEmailAndPassword,
+        signInWithPopup,
+        signOut,
+        updateProfile,
+      } from "https://www.gstatic.com/firebasejs/13.2.0/firebase-auth.js";
+
+      const signedOutView = document.getElementById("signed-out");
+      const signedInView = document.getElementById("signed-in");
+      const verifyView = document.getElementById("verify-email");
+      const message = document.getElementById("message");
+      const emailInput = document.getElementById("email");
+      const passwordInput = document.getElementById("password");
+      const passwordConfirmInput = document.getElementById("password-confirm");
+      const nameInput = document.getElementById("display-name");
+      let auth = null;
+      let creatingAccount = false;
+      let busy = false;
+      let previousToken = null;
+
+      function setFrameHeight() {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: document.body.scrollHeight },
+          "*",
+        );
+      }
+
+      function setValue(value) {
+        window.parent.postMessage(
+          { isStreamlitMessage: true, type: "streamlit:setComponentValue", value, dataType: "json" },
+          "*",
+        );
+      }
+
+      function showMessage(text, isError = false) {
+        message.textContent = text;
+        message.classList.toggle("error", isError);
+        setFrameHeight();
+      }
+
+      function setBusy(value) {
+        busy = value;
+        document.querySelectorAll("button").forEach((button) => {
+          button.disabled = value;
+        });
+      }
+
+      function showSignedOut() {
+        signedOutView.classList.remove("hidden");
+        signedInView.classList.add("hidden");
+        verifyView.classList.add("hidden");
+        setFrameHeight();
+      }
+
+      function showSignedIn(user) {
+        signedOutView.classList.add("hidden");
+        signedInView.classList.remove("hidden");
+        verifyView.classList.add("hidden");
+        document.getElementById("account-email").textContent = user.email || "Touchline account";
+        setFrameHeight();
+      }
+
+      function showVerification(user) {
+        signedOutView.classList.add("hidden");
+        signedInView.classList.add("hidden");
+        verifyView.classList.remove("hidden");
+        document.getElementById("verify-copy").textContent =
+          `Check ${user.email || "your inbox"} for the verification link, then return here and sign in again.`;
+        setValue({ type: "signed_out" });
+        setFrameHeight();
+      }
+
+      function providerFor(name) {
+        if (name === "google") return new GoogleAuthProvider();
+        if (name === "microsoft") return new OAuthProvider("microsoft.com");
+        if (name === "apple") return new OAuthProvider("apple.com");
+        if (name === "github") return new GithubAuthProvider();
+        throw new Error("Unsupported sign-in provider.");
+      }
+
+      function friendlyError(error) {
+        const messages = {
+          "auth/email-already-in-use": "An account already uses this email. Try signing in.",
+          "auth/invalid-credential": "The email or password is incorrect.",
+          "auth/invalid-email": "Enter a valid email address.",
+          "auth/weak-password": "Choose a password with at least 8 characters.",
+          "auth/popup-closed-by-user": "The sign-in window was closed before finishing.",
+          "auth/popup-blocked": "Your browser blocked the sign-in window. Allow popups and try again.",
+          "auth/unauthorized-domain": "This app domain is not authorized in Firebase Authentication.",
+          "auth/account-exists-with-different-credential": "This email already uses another sign-in method. Sign in with that method first.",
+          "auth/operation-not-allowed": "This sign-in method is not enabled in the Firebase console.",
+          "auth/too-many-requests": "Too many attempts. Wait a little and try again.",
+          "auth/network-request-failed": "Could not reach Firebase. Check your connection and try again.",
+        };
+        return messages[error.code] || "Sign-in could not be completed. Check your Firebase provider setup and try again.";
+      }
+
+      async function submitEmailForm() {
+        if (busy) return;
+        setBusy(true);
+        showMessage("");
+        const email = emailInput.value.trim();
+        const password = passwordInput.value;
+        try {
+          if (creatingAccount) {
+            if (password.length < 8) throw { code: "auth/weak-password" };
+            if (password !== passwordConfirmInput.value) {
+              showMessage("The passwords do not match.", true);
+              return;
+            }
+            const credential = await createUserWithEmailAndPassword(auth, email, password);
+            const displayName = nameInput.value.trim();
+            if (displayName) await updateProfile(credential.user, { displayName });
+            await sendEmailVerification(credential.user);
+            showVerification(credential.user);
+            showMessage("Verification email sent. Verify your address before signing in.");
+          } else {
+            const credential = await signInWithEmailAndPassword(auth, email, password);
+            await credential.user.reload();
+            if (!credential.user.emailVerified) {
+              showVerification(credential.user);
+              showMessage("Please verify your email before continuing.", true);
+              return;
+            }
+          }
+        } catch (error) {
+          showMessage(friendlyError(error), true);
+        } finally {
+          setBusy(false);
+          setFrameHeight();
+        }
+      }
+
+      document.getElementById("mode-toggle").addEventListener("click", () => {
+        creatingAccount = !creatingAccount;
+        document.getElementById("form-title").textContent = creatingAccount ? "Create your account" : "Sign in";
+        document.getElementById("mode-toggle").textContent = creatingAccount ? "Already registered? Sign in" : "Create an account";
+        document.getElementById("submit").textContent = creatingAccount ? "Create account" : "Sign in";
+        document.getElementById("forgot").classList.toggle("hidden", creatingAccount);
+        nameInput.classList.toggle("hidden", !creatingAccount);
+        passwordConfirmInput.classList.toggle("hidden", !creatingAccount);
+        passwordInput.autocomplete = creatingAccount ? "new-password" : "current-password";
+        showMessage("");
+        setFrameHeight();
+      });
+
+      document.getElementById("submit").addEventListener("click", submitEmailForm);
+      passwordInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") submitEmailForm();
+      });
+      document.getElementById("forgot").addEventListener("click", async () => {
+        const email = emailInput.value.trim();
+        if (!email) return showMessage("Enter your email address first.", true);
+        try {
+          await sendPasswordResetEmail(auth, email);
+          showMessage("If an account exists for that address, a password reset email has been sent.");
+        } catch (error) {
+          showMessage(friendlyError(error), true);
+        }
+      });
+      document.querySelectorAll("[data-provider]").forEach((button) => {
+        button.addEventListener("click", async () => {
+          if (busy) return;
+          setBusy(true);
+          showMessage("");
+          try {
+            await signInWithPopup(auth, providerFor(button.dataset.provider));
+          } catch (error) {
+            showMessage(friendlyError(error), true);
+          } finally {
+            setBusy(false);
+          }
+        });
+      });
+      document.getElementById("resend-verification").addEventListener("click", async () => {
+        if (!auth.currentUser) return;
+        try {
+          await sendEmailVerification(auth.currentUser);
+          showMessage("A new verification email has been sent.");
+        } catch (error) {
+          showMessage(friendlyError(error), true);
+        }
+      });
+      document.getElementById("verify-continue").addEventListener("click", async () => {
+        if (!auth.currentUser) return;
+        try {
+          await auth.currentUser.reload();
+          if (!auth.currentUser.emailVerified) {
+            return showMessage("The email is not verified yet. Open the link in your inbox first.", true);
+          }
+          await auth.currentUser.getIdToken(true);
+          showMessage("Email verified. You can now continue.");
+        } catch (error) {
+          showMessage(friendlyError(error), true);
+        }
+      });
+      document.getElementById("verify-signout").addEventListener("click", async () => {
+        await signOut(auth);
+        setValue({ type: "signed_out" });
+        showSignedOut();
+      });
+      document.getElementById("logout").addEventListener("click", async () => {
+        await signOut(auth);
+        previousToken = null;
+        setValue({ type: "signed_out" });
+        showMessage("You have been signed out.");
+        showSignedOut();
+      });
+
+      function initialize(config) {
+        if (auth) return;
+        const app = initializeApp(config, `touchline-${config.projectId}`);
+        auth = getAuth(app);
+        onIdTokenChanged(auth, async (user) => {
+          if (!user) {
+            previousToken = null;
+            showSignedOut();
+            return;
+          }
+          const providerIds = user.providerData.map((provider) => provider.providerId);
+          if (providerIds.includes("password") && !user.emailVerified) {
+            showVerification(user);
+            return;
+          }
+          if (!user.email || !user.emailVerified) {
+            await signOut(auth);
+            setValue({ type: "signed_out" });
+            showMessage("Use a provider account with a verified email address.", true);
+            showSignedOut();
+            return;
+          }
+          showSignedIn(user);
+          const token = await user.getIdToken();
+          if (token !== previousToken) {
+            previousToken = token;
+            setValue({ type: "signed_in", idToken: token });
+          }
+        });
+      }
+
+      window.addEventListener("message", (event) => {
+        if (
+          event.source !== window.parent
+          || !event.data
+          || event.data.type !== "streamlit:render"
+        ) return;
+        try {
+          initialize(event.data.args.config);
+        } catch (error) {
+          showMessage("Firebase is not configured correctly. Review the setup guide.", true);
+        }
+      });
+
+      window.parent.postMessage(
+        { isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 },
+        "*",
+      );
+      setFrameHeight();
+    </script>
+  </body>
+</html>

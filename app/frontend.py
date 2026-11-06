@@ -1,4 +1,7 @@
+import csv
 import html
+import io
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -6,6 +9,9 @@ from typing import Any
 import requests
 import streamlit as st
 from dotenv import load_dotenv
+from streamlit.errors import StreamlitSecretNotFoundError
+
+from app.firebase_auth import firebase_auth_component
 
 load_dotenv()
 
@@ -18,6 +24,32 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def firebase_web_config() -> dict[str, str] | None:
+    try:
+        config = st.secrets["firebase"]
+    except (KeyError, StreamlitSecretNotFoundError):
+        return None
+    fields = ("api_key", "auth_domain", "project_id", "app_id")
+    values = {field: str(config.get(field, "")).strip() for field in fields}
+    if not all(values.values()):
+        return None
+    server_project_id = os.getenv("FIREBASE_PROJECT_ID", "").strip()
+    if not server_project_id or values["project_id"] != server_project_id:
+        return None
+    return {
+        "apiKey": values["api_key"],
+        "authDomain": values["auth_domain"],
+        "projectId": values["project_id"],
+        "appId": values["app_id"],
+    }
+
+
+def current_id_token() -> str | None:
+    token = st.session_state.get("firebase_id_token")
+    return token if isinstance(token, str) and token else None
+
 
 st.markdown(
     """
@@ -53,7 +85,23 @@ st.markdown(
     }
     [data-testid="stTextInput"] input::placeholder { color: var(--muted) !important; }
     h1, h2, h3 { font-family: 'Manrope', sans-serif; letter-spacing: -.04em; }
-    .block-container { max-width: 1480px; padding: 1.25rem 2rem 4rem; }
+    .block-container { max-width: 1480px; padding: 5rem 2rem 4rem; }
+    header[data-testid="stHeader"] {
+        background: rgba(10, 16, 15, .96);
+        border-bottom: 1px solid var(--line);
+    }
+    [data-testid="stToolbar"], #MainMenu, footer { display: none !important; }
+    [data-testid="stRadio"] > div[role="radiogroup"] {
+        gap: 8px;
+        padding: 6px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: #101815;
+    }
+    [data-testid="stRadio"] label {
+        border-radius: 9px;
+        padding: 5px 12px;
+    }
     [data-testid="stSidebar"] {
         background: #0e1714;
         border-right: 1px solid var(--line);
@@ -156,6 +204,11 @@ st.markdown(
     .empty-state h3 { margin:8px 0; }
     .empty-state p { color:var(--muted); margin:0; }
     .disclaimer { color:var(--muted); font-size:.76rem; line-height:1.5; }
+    @media (max-width: 700px) {
+        .block-container { padding: 4.75rem 1rem 3rem; }
+        .masthead { align-items:flex-start; flex-direction:column; }
+        .hero { padding:24px; }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -163,8 +216,13 @@ st.markdown(
 
 
 def api_get(path: str, params: dict[str, Any] | None = None) -> dict:
+    token = current_id_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     response = requests.get(
-        f"{API_URL}{path}", params=params, timeout=REQUEST_TIMEOUT
+        f"{API_URL}{path}",
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     payload = response.json()
@@ -174,8 +232,45 @@ def api_get(path: str, params: dict[str, Any] | None = None) -> dict:
 
 
 def api_post(path: str, params: dict[str, Any]) -> dict:
+    token = current_id_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     response = requests.post(
-        f"{API_URL}{path}", params=params, timeout=REQUEST_TIMEOUT
+        f"{API_URL}{path}",
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("The analyzer API returned an invalid response.")
+    return payload
+
+
+def api_post_json(path: str, payload: dict[str, Any]) -> dict:
+    token = current_id_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = requests.post(
+        f"{API_URL}{path}",
+        json=payload,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict):
+        raise ValueError("The analyzer API returned an invalid response.")
+    return result
+
+
+def api_delete(path: str, params: dict[str, Any] | None = None) -> dict:
+    token = current_id_token()
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    response = requests.delete(
+        f"{API_URL}{path}",
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
     payload = response.json()
@@ -216,8 +311,19 @@ def load_standings(league_id: int, season: int) -> list[dict]:
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def load_recent_predictions(limit: int) -> list[dict]:
-    rows = api_get("/predictions/recent", {"limit": limit}).get("predictions")
+def load_recent_predictions(limit: int, auth_token: str) -> list[dict]:
+    token = auth_token
+    response = requests.get(
+        f"{API_URL}/predictions/recent",
+        params={"limit": limit},
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("The analyzer API returned an invalid response.")
+    rows = payload.get("predictions")
     if not isinstance(rows, list):
         raise ValueError("The API returned invalid prediction history.")
     return rows
@@ -233,6 +339,61 @@ def display_error(error: requests.RequestException | ValueError) -> None:
         st.error(f"Could not load live data: {detail}")
     else:
         st.error(f"Could not complete the request: {error}")
+
+
+@st.dialog("Delete saved prediction")
+def confirm_delete_prediction(prediction_id: int, match_label: str) -> None:
+    st.warning(f"Delete **{match_label}** from your saved predictions?")
+    delete_column, cancel_column = st.columns(2)
+    if delete_column.button("Delete prediction", type="primary", use_container_width=True):
+        try:
+            api_delete(f"/predictions/{prediction_id}")
+            load_recent_predictions.clear()
+            st.session_state["history_notice"] = "Prediction deleted."
+            st.rerun()
+        except (requests.RequestException, ValueError) as error:
+            display_error(error)
+    if cancel_column.button("Cancel", use_container_width=True):
+        st.rerun()
+
+
+@st.dialog("Delete all saved predictions")
+def confirm_delete_all_predictions() -> None:
+    st.warning(
+        "This permanently deletes every saved prediction in your workspace, "
+        "including entries not currently shown. This action cannot be undone."
+    )
+    delete_column, cancel_column = st.columns(2)
+    if delete_column.button("Delete all", type="primary", use_container_width=True):
+        try:
+            result = api_delete("/predictions", {"confirm": "true"})
+            load_recent_predictions.clear()
+            st.session_state["history_notice"] = (
+                f"Deleted {result.get('count', 0)} saved predictions."
+            )
+            st.rerun()
+        except (requests.RequestException, ValueError) as error:
+            display_error(error)
+    if cancel_column.button("Keep predictions", use_container_width=True):
+        st.rerun()
+
+
+@st.dialog("Delete prediction slate")
+def confirm_delete_slate(slate_id: int, slate_name: str) -> None:
+    st.warning(
+        f"Delete **{slate_name}** and all predictions saved in that slate?"
+    )
+    delete_column, cancel_column = st.columns(2)
+    if delete_column.button("Delete slate", type="primary", use_container_width=True):
+        try:
+            api_delete(f"/predictions/slates/{slate_id}")
+            load_recent_predictions.clear()
+            st.session_state["history_notice"] = "Slate and its predictions deleted."
+            st.rerun()
+        except (requests.RequestException, ValueError) as error:
+            display_error(error)
+    if cancel_column.button("Keep slate", use_container_width=True):
+        st.rerun()
 
 
 def parse_kickoff(value: str | None) -> datetime | None:
@@ -294,73 +455,90 @@ def show_setup_message() -> None:
         <div class="empty-state">
           <div class="eyebrow">YOUR MATCHDAY, AT A GLANCE</div>
           <h3>Pick a competition to get started</h3>
-          <p>Choose your country and season in the sidebar, find a league, then load
-          its live fixtures to explore forecasts, form and the table.</p>
+          <p>Choose your country and season above, explore the available leagues, then
+          load a match centre to explore forecasts, form and the table.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
+firebase_config = firebase_web_config()
+if firebase_config is None:
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="eyebrow">PRIVATE MATCHDAY WORKSPACE</div>
+          <h1>Sign-in setup needed</h1>
+          <p>Set up Firebase Authentication to enable private accounts, email
+          verification and social sign-in.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.error(
+        "Firebase web settings are missing, incomplete, or do not match the "
+        "server project ID."
+    )
+    st.info(
+        "Create a Firebase project and Web app. Enable Email/Password, Google, "
+        "Microsoft, Apple and GitHub under Authentication → Sign-in method. "
+        "Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` "
+        "and fill in the Web app config. In `.env`, set the matching "
+        "`FIREBASE_PROJECT_ID` and `GOOGLE_APPLICATION_CREDENTIALS` path to a "
+        "Firebase Admin service-account JSON file; keep that file private and "
+        "outside source control. Add `localhost` to Firebase's authorized domains. "
+        "For Microsoft, Apple and GitHub, also enter their provider credentials "
+        "in Firebase and register Firebase's callback URL with each provider."
+    )
+    st.stop()
+
+if not current_id_token():
+    st.markdown(
+        """
+        <div class="hero">
+          <div class="eyebrow">TOUCHLINE · FOOTBALL INTELLIGENCE</div>
+          <h1>Your matchday, your workspace.</h1>
+          <p>Create an account with email or continue with a provider to build
+          private match slates and track your forecasts. Predictions are estimates,
+          never guarantees.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+auth_event = firebase_auth_component(firebase_config)
+if isinstance(auth_event, dict):
+    if auth_event.get("type") == "signed_in":
+        token = auth_event.get("idToken")
+        if isinstance(token, str) and token:
+            st.session_state["firebase_id_token"] = token
+    elif auth_event.get("type") == "signed_out":
+        st.session_state.pop("firebase_id_token", None)
+
+id_token_value = current_id_token()
+if not id_token_value:
+    st.stop()
+
+try:
+    account = api_get("/auth/me")
+except (requests.RequestException, ValueError) as error:
+    display_error(error)
+    st.info("Use the account panel above to sign out and try again.")
+    st.stop()
+
+if st.session_state.get("active_account_id") not in (None, account["id"]):
+    st.session_state.clear()
+    st.session_state["active_account_id"] = account["id"]
+    st.rerun()
+st.session_state["active_account_id"] = account["id"]
+
+
 with st.sidebar:
     st.markdown('<div class="brand-mark">⚽</div>', unsafe_allow_html=True)
     st.markdown("## Touchline")
     st.caption("Football intelligence, made clear.")
-    st.divider()
-    st.markdown('<div class="section-kicker">Competition</div>', unsafe_allow_html=True)
-    country_name = st.text_input("Country", value="England")
-    st.caption(
-        "Coverage varies by plan. Try England, Germany, Spain, Italy, France, Brazil, "
-        "the Netherlands or Portugal."
-    )
-    season = st.number_input(
-        "Season", min_value=2000, max_value=2100, value=2026, step=1
-    )
-    if st.button("Explore leagues", use_container_width=True):
-        for key in ("leagues", "fixtures", "analysis", "selected_league"):
-            st.session_state.pop(key, None)
-        try:
-            with st.spinner("Finding available competitions…"):
-                st.session_state["leagues"] = load_leagues(
-                    country_name.strip(), int(season)
-                )
-            st.session_state["league_query"] = (country_name.strip(), int(season))
-        except (requests.RequestException, ValueError) as error:
-            display_error(error)
-
-    available_leagues = st.session_state.get("leagues", [])
-    league_query = st.session_state.get("league_query")
-    if available_leagues and league_query == (country_name.strip(), int(season)):
-        selected_league = st.selectbox(
-            "League",
-            available_leagues,
-            format_func=lambda league: league["name"],
-            key="league_picker",
-        )
-        horizon_label = st.selectbox(
-            "Fixture window", ["Next 7 days", "Next 14 days", "Next 30 days"], index=2
-        )
-        horizon_days = int(horizon_label.split()[1])
-        if st.button(
-            "Load match centre", type="primary", use_container_width=True
-        ):
-            for key in ("analysis", "fixtures"):
-                st.session_state.pop(key, None)
-            try:
-                with st.spinner("Loading fixtures for your competition…"):
-                    st.session_state["fixtures"] = load_fixtures(
-                        selected_league["id"], int(season), horizon_days
-                    )
-                st.session_state["fixture_query"] = (
-                    selected_league["id"],
-                    int(season),
-                )
-                st.session_state["selected_league"] = selected_league
-                st.session_state["horizon_days"] = horizon_days
-            except (requests.RequestException, ValueError) as error:
-                display_error(error)
-    elif league_query == (country_name.strip(), int(season)):
-        st.info("No competitions were found for that country and season.")
+    st.caption(f"Signed in as {account['display_name']}")
     st.divider()
     st.markdown(
         '<div class="disclaimer">Live data by football-data.org · Probabilities are '
@@ -389,6 +567,98 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+with st.container(border=True):
+    st.markdown('<div class="section-kicker">START YOUR MATCHDAY</div>', unsafe_allow_html=True)
+    competition_controls = st.columns([2, 1, 1.15], vertical_alignment="bottom")
+    with competition_controls[0]:
+        country_name = st.text_input(
+            "Country",
+            value="England",
+            key="country_name_input",
+        )
+    with competition_controls[1]:
+        season = st.number_input(
+            "Season",
+            min_value=2000,
+            max_value=2100,
+            value=2026,
+            step=1,
+            key="season_input",
+        )
+    with competition_controls[2]:
+        explore_leagues = st.button(
+            "Explore leagues",
+            type="primary",
+            use_container_width=True,
+            key="explore_leagues_main",
+        )
+
+    st.caption(
+        "Choose a country and season to find available competitions. Coverage depends "
+        "on football-data.org; try England, Germany, Spain, Italy, France, Brazil, "
+        "the Netherlands or Portugal."
+    )
+    if explore_leagues:
+        for key in ("leagues", "fixtures", "analysis", "selected_league"):
+            st.session_state.pop(key, None)
+        try:
+            with st.spinner("Finding available competitions…"):
+                st.session_state["leagues"] = load_leagues(
+                    country_name.strip(), int(season)
+                )
+            st.session_state["league_query"] = (country_name.strip(), int(season))
+        except (requests.RequestException, ValueError) as error:
+            display_error(error)
+
+    available_leagues = st.session_state.get("leagues", [])
+    league_query = st.session_state.get("league_query")
+    if available_leagues and league_query == (country_name.strip(), int(season)):
+        matchday_controls = st.columns([2, 1, 1.15], vertical_alignment="bottom")
+        with matchday_controls[0]:
+            selected_league = st.selectbox(
+                "Competition",
+                available_leagues,
+                format_func=lambda league: league["name"],
+                key="league_picker",
+            )
+        with matchday_controls[1]:
+            horizon_label = st.selectbox(
+                "Fixture window",
+                ["Next 7 days", "Next 14 days", "Next 30 days"],
+                index=2,
+            )
+            horizon_days = int(horizon_label.split()[1])
+        with matchday_controls[2]:
+            load_match_centre = st.button(
+                "Load match centre",
+                type="primary",
+                use_container_width=True,
+                key="load_match_centre_main",
+            )
+        if load_match_centre:
+            for key in (
+                "analysis",
+                "fixtures",
+                "batch_fixture_ids",
+                "latest_slate_result",
+            ):
+                st.session_state.pop(key, None)
+            try:
+                with st.spinner("Loading fixtures for your competition…"):
+                    st.session_state["fixtures"] = load_fixtures(
+                        selected_league["id"], int(season), horizon_days
+                    )
+                st.session_state["fixture_query"] = (
+                    selected_league["id"],
+                    int(season),
+                )
+                st.session_state["selected_league"] = selected_league
+                st.session_state["horizon_days"] = horizon_days
+            except (requests.RequestException, ValueError) as error:
+                display_error(error)
+    elif league_query == (country_name.strip(), int(season)):
+        st.info("No competitions were found for that country and season.")
 
 fixtures = st.session_state.get("fixtures")
 selected_league = st.session_state.get("selected_league")
@@ -454,6 +724,154 @@ if view == "Match centre":
     if not filtered_fixtures:
         st.info("No fixtures match those filters. Try another date or clear the search.")
     else:
+        fixture_by_id = {fixture["id"]: fixture for fixture in filtered_fixtures}
+        st.markdown("#### Build a matchday slate")
+        st.caption(
+            "Select up to 40 fixtures from this competition. Every pick is forecast "
+            "independently; combined accumulator probabilities are not implied."
+        )
+        selected_fixture_ids = st.multiselect(
+            "Fixtures for this slate",
+            options=list(fixture_by_id),
+            format_func=lambda fixture_id: fixture_label(
+                fixture_by_id[fixture_id]
+            ),
+            max_selections=40,
+            key="batch_fixture_ids",
+        )
+        slate_odds: dict[int, float | None] = {}
+        if selected_fixture_ids:
+            st.caption(
+                "Optionally enter the home-win decimal odds shown by your bookmaker. "
+                "Leave a price blank if you do not want an edge estimate."
+            )
+            odds_rows = [
+                {
+                    "Fixture ID": fixture_id,
+                    "Fixture": fixture_label(fixture_by_id[fixture_id]),
+                    "Home odds": None,
+                }
+                for fixture_id in selected_fixture_ids
+            ]
+            odds_editor_key = "slate_odds_" + "_".join(
+                str(fixture_id) for fixture_id in sorted(selected_fixture_ids)
+            )
+            edited_odds = st.data_editor(
+                odds_rows,
+                hide_index=True,
+                disabled=["Fixture ID", "Fixture"],
+                column_config={
+                    "Fixture ID": None,
+                    "Fixture": st.column_config.TextColumn("Fixture"),
+                    "Home odds": st.column_config.NumberColumn(
+                        "Home odds",
+                        min_value=1.01,
+                        max_value=100.0,
+                        step=0.01,
+                        format="%.2f",
+                    ),
+                },
+                key=odds_editor_key,
+                use_container_width=True,
+            )
+            slate_odds = {
+                int(row["Fixture ID"]): (
+                    float(row["Home odds"])
+                    if row.get("Home odds") is not None
+                    and math.isfinite(float(row["Home odds"]))
+                    else None
+                )
+                for row in edited_odds.to_dict("records")
+            }
+        slate_controls = st.columns([2, 1])
+        with slate_controls[0]:
+            slate_name = st.text_input(
+                "Slate name",
+                value=f"{selected_league['name']} · {today:%d %b}",
+                max_chars=120,
+                key="new_slate_name",
+            )
+        with slate_controls[1]:
+            if st.button(
+                f"Forecast {len(selected_fixture_ids)} fixtures",
+                type="primary",
+                disabled=not selected_fixture_ids,
+                use_container_width=True,
+                key="create_prediction_slate",
+            ):
+                payload = {
+                    "name": slate_name.strip() or "Matchday slate",
+                    "fixtures": [
+                        {
+                            "fixture_id": fixture_id,
+                            "league_id": selected_league["id"],
+                            "season": int(season),
+                            "match_date": fixture_by_id[fixture_id]["date"][:10],
+                            "bookie_home_odds": slate_odds.get(fixture_id),
+                        }
+                        for fixture_id in selected_fixture_ids
+                    ],
+                }
+                try:
+                    with st.spinner(
+                        f"Building {len(selected_fixture_ids)} forecasts… "
+                        "Provider limits may affect large batches."
+                    ):
+                        st.session_state["latest_slate_result"] = api_post_json(
+                            "/predictions/slates", payload
+                        )
+                    load_recent_predictions.clear()
+                except (requests.RequestException, ValueError) as error:
+                    display_error(error)
+
+        slate_result = st.session_state.get("latest_slate_result")
+        if slate_result:
+            slate = slate_result.get("slate")
+            if slate:
+                st.success(
+                    f"Saved **{slate['prediction_count']}** predictions to "
+                    f"**{slate['name']}**."
+                )
+                st.dataframe(
+                    [
+                        {
+                            "Fixture": prediction["match"],
+                            "Home xG": f"{prediction['expected_goals']['home_xg']:.2f}",
+                            "Away xG": f"{prediction['expected_goals']['away_xg']:.2f}",
+                            "Home win": f"{prediction['probabilities']['home_win']:.1%}",
+                            "Draw": f"{prediction['probabilities']['draw']:.1%}",
+                            "Away win": f"{prediction['probabilities']['away_win']:.1%}",
+                            "Fair home odds": (
+                                f"{prediction['calculated_fair_odds']['home_win']:.2f}"
+                                if prediction["calculated_fair_odds"]["home_win"] is not None
+                                else "—"
+                            ),
+                            "Book odds": (
+                                f"{prediction['value_analysis']['bookie_home_odds']:.2f}"
+                                if prediction["value_analysis"]["bookie_home_odds"]
+                                is not None
+                                else "—"
+                            ),
+                            "Home EV": (
+                                f"{prediction['value_analysis']['ev_percentage']:+.1f}%"
+                                if prediction["value_analysis"]["ev_percentage"]
+                                is not None
+                                else "—"
+                            ),
+                        }
+                        for prediction in slate_result["predictions"]
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            failures = slate_result.get("failures", [])
+            if failures:
+                st.warning(
+                    f"{len(failures)} fixture(s) could not be forecast. "
+                    "Successful picks were still saved."
+                )
+                st.dataframe(failures, hide_index=True, use_container_width=True)
+
         selected_fixture = st.selectbox(
             "Choose a fixture to explore",
             filtered_fixtures,
@@ -694,47 +1112,242 @@ elif view == "League table":
 
 else:
     st.markdown('<div class="section-kicker">YOUR WORKSPACE · RECENT FORECASTS</div>', unsafe_allow_html=True)
+    notice = st.session_state.pop("history_notice", None)
+    if notice:
+        st.success(notice)
     try:
-        history = load_recent_predictions(25)
-        if not history:
-            show_setup_message()
-        else:
-            value_bets = [row for row in history if row["is_value_bet"]]
-            avg_home_prob = sum(row["prob_home_win"] for row in history) / len(history)
-            metric_columns = st.columns(3)
-            metric_columns[0].metric("Forecasts saved", len(history))
-            metric_columns[1].metric("Above value threshold", len(value_bets))
-            metric_columns[2].metric("Average home probability", f"{avg_home_prob:.1%}")
-            st.dataframe(
-                [
-                    {
-                        "Match": f"{row['home_team']} vs {row['away_team']}",
-                        "Kickoff": (
-                            row["match_date"][:16].replace("T", " ")
-                            if row["match_date"]
-                            else "—"
-                        ),
-                        "xG": f"{row['home_xg']:.2f} – {row['away_xg']:.2f}",
-                        "Home": f"{row['prob_home_win']:.1%}",
-                        "Draw": f"{row['prob_draw']:.1%}",
-                        "Away": f"{row['prob_away_win']:.1%}",
-                        "Book price": (
-                            f"{row['bookie_home_odds']:.2f}"
-                            if row["bookie_home_odds"]
-                            else "—"
-                        ),
-                        "EV": (
-                            f"{row['ev_percentage']:+.2f}%"
-                            if row["ev_percentage"] is not None
-                            else "—"
-                        ),
-                        "Value": "Yes" if row["is_value_bet"] else "—",
-                    }
-                    for row in history
-                ],
-                hide_index=True,
-                use_container_width=True,
+        history = load_recent_predictions(200, id_token_value)
+        slates = api_get("/predictions/slates", {"limit": 100}).get("slates")
+        performance = api_get("/predictions/performance")
+        if not isinstance(slates, list):
+            raise ValueError("The API returned invalid saved slates.")
+        pending_count = performance["eligible_for_settlement"]
+        history_controls = st.columns([1.35, 1, 1, 1.15])
+        history_controls[0].metric(
+            "1X2 top-pick accuracy",
+            (
+                f"{performance['accuracy']:.1%}"
+                if performance["accuracy"] is not None
+                else "Not enough results"
+            ),
+            f"{performance['correct_outcomes']} correct",
+        )
+        history_controls[1].metric(
+            "Results tracked",
+            performance["settled_count"],
+            f"{performance['pending_results']} pending",
+        )
+        history_controls[2].metric(
+            "Mean Brier score",
+            (
+                f"{performance['mean_brier_score']:.3f}"
+                if performance["mean_brier_score"] is not None
+                else "—"
+            ),
+            "Lower is better",
+        )
+        if history_controls[3].button(
+            "Check finished results",
+            disabled=pending_count == 0,
+            use_container_width=True,
+        ):
+            try:
+                report = api_post("/predictions/results/refresh", {"limit": 15})
+                st.session_state["result_refresh_report"] = report
+                load_recent_predictions.clear()
+                st.rerun()
+            except (requests.RequestException, ValueError) as error:
+                display_error(error)
+
+        result_report = st.session_state.pop("result_refresh_report", None)
+        if result_report:
+            st.success(
+                f"Updated {result_report['updated_count']} finished results. "
+                f"{result_report['pending_count']} eligible predictions remain unchecked."
             )
+            if result_report["failures"]:
+                st.warning(
+                    f"{len(result_report['failures'])} result lookup(s) failed; "
+                    "you can retry later."
+                )
+
+        if slates:
+            slate_controls = st.columns([2, 1])
+            with slate_controls[0]:
+                selected_slate = st.selectbox(
+                    "Saved slate",
+                    [None, *slates],
+                    format_func=lambda slate: (
+                        "All predictions"
+                        if slate is None
+                        else f"{slate['name']} · {slate['prediction_count']} picks"
+                    ),
+                    key="history_slate_filter",
+                )
+            with slate_controls[1]:
+                slate_to_delete = st.selectbox(
+                    "Slate actions",
+                    slates,
+                    format_func=lambda slate: slate["name"],
+                    key="history_slate_actions",
+                )
+                if st.button("Delete slate"):
+                    confirm_delete_slate(
+                        slate_to_delete["id"], slate_to_delete["name"]
+                    )
+        else:
+            selected_slate = None
+
+        if not history:
+            st.markdown(
+                """
+                <div class="empty-state">
+                  <div class="eyebrow">YOUR WORKSPACE</div>
+                  <h3>No saved predictions yet</h3>
+                  <p>Run a fixture forecast in the Match centre and it will appear here.</p>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            filter_columns = st.columns([2, 1, 1])
+            with filter_columns[0]:
+                prediction_search = st.text_input(
+                    "Search saved matches",
+                    placeholder="Search a club…",
+                    label_visibility="collapsed",
+                ).strip().casefold()
+            with filter_columns[1]:
+                value_only = st.toggle("Value picks only")
+            with filter_columns[2]:
+                if st.button("Refresh history"):
+                    load_recent_predictions.clear()
+                    st.rerun()
+
+            visible_history = [
+                row
+                for row in history
+                if (
+                    selected_slate is None
+                    or row["slate_id"] == selected_slate["id"]
+                )
+                if (
+                    not prediction_search
+                    or prediction_search
+                    in f"{row['home_team']} {row['away_team']}".casefold()
+                )
+                and (not value_only or row["is_value_bet"])
+            ]
+            if not visible_history:
+                st.info("No saved predictions match those filters.")
+            else:
+                value_bets = [
+                    row for row in visible_history if row["is_value_bet"]
+                ]
+                avg_home_prob = sum(
+                    row["prob_home_win"] for row in visible_history
+                ) / len(visible_history)
+                metric_columns = st.columns(3)
+                metric_columns[0].metric("Forecasts shown", len(visible_history))
+                metric_columns[1].metric("Above value threshold", len(value_bets))
+                metric_columns[2].metric(
+                    "Average home probability", f"{avg_home_prob:.1%}"
+                )
+                st.dataframe(
+                    [
+                        {
+                            "ID": row["id"],
+                            "Slate": row["slate_id"] or "Single forecast",
+                            "Match": f"{row['home_team']} vs {row['away_team']}",
+                            "Kickoff": (
+                                row["match_date"][:16].replace("T", " ")
+                                if row["match_date"]
+                                else "—"
+                            ),
+                            "xG": f"{row['home_xg']:.2f} – {row['away_xg']:.2f}",
+                            "Home": f"{row['prob_home_win']:.1%}",
+                            "Draw": f"{row['prob_draw']:.1%}",
+                            "Away": f"{row['prob_away_win']:.1%}",
+                            "Book price": (
+                                f"{row['bookie_home_odds']:.2f}"
+                                if row["bookie_home_odds"]
+                                else "—"
+                            ),
+                            "EV": (
+                                f"{row['ev_percentage']:+.2f}%"
+                                if row["ev_percentage"] is not None
+                                else "—"
+                            ),
+                            "Value": "Yes" if row["is_value_bet"] else "—",
+                            "Result": (
+                                f"{row['actual_home_goals']}–{row['actual_away_goals']}"
+                                if row["actual_outcome"] is not None
+                                else "Pending"
+                                if row["fixture_id"] is not None
+                                else "—"
+                            ),
+                        }
+                        for row in visible_history
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+                csv_buffer = io.StringIO()
+                export_fields = [
+                    "id",
+                    "slate_id",
+                    "match_date",
+                    "home_team",
+                    "away_team",
+                    "home_xg",
+                    "away_xg",
+                    "prob_home_win",
+                    "prob_draw",
+                    "prob_away_win",
+                    "bookie_home_odds",
+                    "ev_percentage",
+                    "is_value_bet",
+                    "actual_home_goals",
+                    "actual_away_goals",
+                    "actual_outcome",
+                ]
+                writer = csv.DictWriter(csv_buffer, fieldnames=export_fields)
+                writer.writeheader()
+                writer.writerows(
+                    {field: row.get(field) for field in export_fields}
+                    for row in visible_history
+                )
+                action_columns = st.columns([1, 1, 1])
+                with action_columns[0]:
+                    selected_prediction = st.selectbox(
+                        "Prediction to delete",
+                        visible_history,
+                        format_func=lambda row: (
+                            f"#{row['id']} · {row['home_team']} vs {row['away_team']}"
+                        ),
+                        key="prediction_to_delete",
+                    )
+                    if st.button("Delete selected", key="delete_one_prediction"):
+                        confirm_delete_prediction(
+                            selected_prediction["id"],
+                            f"{selected_prediction['home_team']} vs "
+                            f"{selected_prediction['away_team']}",
+                        )
+                with action_columns[1]:
+                    st.download_button(
+                        "Export visible predictions",
+                        data=csv_buffer.getvalue(),
+                        file_name="touchline-predictions.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with action_columns[2]:
+                    if st.button(
+                        "Delete all history",
+                        key="delete_all_predictions",
+                        type="secondary",
+                    ):
+                        confirm_delete_all_predictions()
     except (requests.RequestException, ValueError) as error:
         display_error(error)
 

@@ -1,4 +1,6 @@
 .env
+.streamlit/secrets.toml
+firebase-service-account*.json
 __pycache__/
 *.py[cod]
 venv/

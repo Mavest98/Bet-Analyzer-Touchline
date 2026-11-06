@@ -1,4 +1,6 @@
 fastapi
+firebase-admin
+google-auth
 numpy
 psycopg2-binary
 python-dotenv

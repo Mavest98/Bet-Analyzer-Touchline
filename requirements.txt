@@ -1,0 +1,9 @@
+fastapi
+numpy
+psycopg2-binary
+python-dotenv
+requests
+sqlalchemy
+scipy
+streamlit
+uvicorn[standard]
